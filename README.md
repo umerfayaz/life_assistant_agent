@@ -48,9 +48,15 @@ This makes it more than automation — it’s an **autonomous decision-making sy
 ---
 
 ## 📸 Demo Screenshots
-| Email Detection | Calendar Booking | Terminal View |
-|-----------------|------------------|---------------|
-| ![Email](ai_sidekick/assets/email.png) | ![Calendar](ai_sidekick/assets/calendar.png) | ![Terminal](ai_sidekick/assets/terminal.png) | ![slack](ai_sidekick/assets/slack.png) | ![Email_detect](ai_sidekick/assets/email_detect.png).
+
+| Email | Email Detection | Calendar |
+|-------|-----------------|----------|
+| ![Email](ai_sidekick/assets/email.png) | ![Detect](ai_sidekick/assets/email_detect.png) | ![Calendar](ai_sidekick/assets/calendar.png) |
+
+| Slack Integration | Terminal View |
+|-------------------|---------------|
+| ![Slack](ai_sidekick/assets/slack.png) | ![Terminal](ai_sidekick/assets/terminal.png) |
+
 
 ---
 
