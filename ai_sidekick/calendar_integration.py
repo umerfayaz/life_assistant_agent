@@ -1,18 +1,29 @@
 import pickle
 import os
-from datetime import datetime, tzinfo
+from datetime import datetime, timedelta, tzinfo
 import zoneinfo
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from google.auth.transport.requests import Request
 from dateutil import parser
 from zoneinfo import ZoneInfo
+import re
+import dateparser
 
 CREDENTIAL_FILE = "client_secret.json"
 
-scopes = ['https://www.googleapis.com/auth/calendar']
+# ✅ Support both Calendar and Gmail
+SCOPES = [
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/calendar.events",
+    "https://www.googleapis.com/auth/gmail.readonly",   # read emails
+    "https://www.googleapis.com/auth/gmail.send",       # send emails
+    "https://www.googleapis.com/auth/gmail.modify"      # mark as read etc.
+]
 
-def get_calendar_service():
+KARACHI_TZ = ZoneInfo("Asia/Karachi")
+
+def get_credentials():
     creds = None
     
     # Load existing token
@@ -20,7 +31,7 @@ def get_calendar_service():
         with open("token.pickle", "rb") as token:
             creds = pickle.load(token)
     
-    # If there are no (valid) credentials available, let the user log in.
+    # If no valid creds → login
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             try:
@@ -33,94 +44,102 @@ def get_calendar_service():
             if not os.path.exists(CREDENTIAL_FILE):
                 raise FileNotFoundError(f"{CREDENTIAL_FILE} not found. Please download it from Google Cloud Console.")
             
-            flow = InstalledAppFlow.from_client_secrets_file(
-                CREDENTIAL_FILE, scopes
-            )
+            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIAL_FILE, SCOPES)
             creds = flow.run_local_server(port=0)
             
-            # Save the credentials for the next run
+            # Save creds
             with open("token.pickle", "wb") as token:
                 pickle.dump(creds, token)
     
-    service = build("calendar", "v3", credentials=creds)
-    return service
+    return creds
 
-def create_event(summary, description="", start_time=None, end_time=None):
+
+def get_calendar_service():
+    creds = get_credentials()
+    return build("calendar", "v3", credentials=creds)
+
+
+def get_gmail_service():
+    creds = get_credentials()
+    return build("gmail", "v1", credentials=creds)
+
+
+def fix_timezone(dt_str):
+    """Fixed timezone handling function"""
+    if not dt_str:
+        return None
+    
+    print(f"DEBUG: Processing datetime string: {dt_str}")
+    
+    try:
+        dt = parser.isoparse(dt_str)  # Parse ISO string
+        print(f"DEBUG: Parsed datetime: {dt} (has timezone: {dt.tzinfo is not None})")
+        
+        if dt.tzinfo is None:  # If no timezone info, assume Karachi
+            dt = dt.replace(tzinfo=KARACHI_TZ)
+            print(f"DEBUG: Added Karachi timezone: {dt}")
+        else:
+            # Fixed syntax - remove 'tzinfo=' parameter
+            dt = dt.astimezone(KARACHI_TZ)
+            print(f"DEBUG: Converted to Karachi timezone: {dt}")
+        
+        result = dt.isoformat()
+        print(f"DEBUG: Final datetime: {result}")
+        return result
+        
+    except Exception as e:
+        print(f"ERROR: Timezone conversion failed for '{dt_str}': {e}")
+        # Fallback: assume it's already in Karachi time
+        return dt_str
+
+
+def create_event(summary, start_time, end_time, description="", location="", attendees=None):
+    """Create a new calendar event"""
     try:
         service = get_calendar_service()
+        if not service:
+            return None
         
-        if not summary:
-            return "Error: Event summary is required"
+        if attendees is None:
+            attendees = []
         
-        KARACHI_TZ = ZoneInfo("Asia/Karachi")
-        
-        # Fixed timezone handling function
-        def fix_timezone(dt_str):
-            if not dt_str:
-                return None
-            
-            print(f"DEBUG: Processing datetime string: {dt_str}")
-            
-            try:
-                dt = parser.isoparse(dt_str)  # Parse ISO string
-                print(f"DEBUG: Parsed datetime: {dt} (has timezone: {dt.tzinfo is not None})")
-                
-                if dt.tzinfo is None:  # If no timezone info, assume Karachi
-                    dt = dt.replace(tzinfo=KARACHI_TZ)
-                    print(f"DEBUG: Added Karachi timezone: {dt}")
-                else:
-                    # Fixed syntax - remove 'tzinfo=' parameter
-                    dt = dt.astimezone(KARACHI_TZ)
-                    print(f"DEBUG: Converted to Karachi timezone: {dt}")
-                
-                result = dt.isoformat()
-                print(f"DEBUG: Final datetime: {result}")
-                return result
-                
-            except Exception as e:
-                print(f"ERROR: Timezone conversion failed for '{dt_str}': {e}")
-                # Fallback: assume it's already in Karachi time
-                return dt_str
-
         start_time = fix_timezone(start_time)
         end_time = fix_timezone(end_time)
         
         print(f"DEBUG: Creating event with times - Start: {start_time}, End: {end_time}")
 
         event = {
-            "summary": summary,
-            "description": description or "",
-            "start": {
-                "dateTime": start_time,
-                "timeZone": "Asia/Karachi"
+            'summary': summary,
+            'description': description,
+            'location': location,
+            'start': {
+                'dateTime': start_time,
+                'timeZone': 'Asia/Karachi'
             },
-            "end": {
-                "dateTime": end_time,
-                "timeZone": "Asia/Karachi"
+            'end': {
+                'dateTime': end_time,
+                'timeZone': 'Asia/Karachi'
             },
-            "reminders": {
-                "useDefault": False,
-                "overrides": [
-                    {"method": "email", "minutes": 24 * 60},
-                    {"method": "popup", "minutes": 10},
+            'attendees': [{'email': email} for email in attendees],
+            'reminders': {
+                'useDefault': False,
+                'overrides': [
+                    {'method': 'email', 'minutes': 60},
+                    {'method': 'popup', 'minutes': 15},
                 ],
             },
         }
         
-        created_event = service.events().insert(calendarId="primary", body=event).execute()
-        
-        event_link = created_event.get('htmlLink', 'No link available')
-        event_id = created_event.get('id', 'No ID available')
-        
-        return f"Event '{summary}' created successfully!\nEvent ID: {event_id}\nLink: {event_link}"
-        
+        event_result = service.events().insert(calendarId="primary", body=event).execute()
+        print(f"Event created:{event_result.get('htmlLink')}")
+        return event_result
+
     except Exception as e:
-        print(f"Exception in create_event: {e}")
-        import traceback
-        print(f"Traceback: {traceback.format_exc()}")
-        return f"Error creating event: {str(e)}"
+        print(f"[Error] Failed to create event{e}")
+        return None
 
 def update_event(event_id, summary=None, description=None, start_time=None, end_time=None):
+    """Update an existing calendar event"""
     try:
         service = get_calendar_service()
         
@@ -164,7 +183,9 @@ def update_event(event_id, summary=None, description=None, start_time=None, end_
     except Exception as e:
         return f"Error updating event: {str(e)}"
 
+
 def list_events(n=5):
+    """List upcoming calendar events"""
     try:
         service = get_calendar_service()
         now = datetime.now().isoformat() + "Z"
@@ -179,9 +200,6 @@ def list_events(n=5):
         
         events = events_result.get("items", [])
         
-        if not events:
-            return "No upcoming events found."
-        
         event_list = []
         for event in events:
             summary = event.get('summary', 'No title')
@@ -189,24 +207,84 @@ def list_events(n=5):
             event_id = event.get('id', 'No ID')
             
             # Format the datetime for better readability
-            try:
-                if 'T' in start:
-                    start_dt = datetime.fromisoformat(start.replace('Z', '+00:00'))
-                    formatted_time = start_dt.strftime('%Y-%m-%d %H:%M')
-                else:
-                    formatted_time = start
-            except:
-                formatted_time = start
-            
-            event_list.append(f"📅 {summary}\n   🕐 {formatted_time}\n   🆔 {event_id}")
-        
-        return f"📋 Upcoming events:\n\n" + "\n\n".join(event_list)
-        
-    except Exception as e:
-        return f"Error listing events: {str(e)}"
+            event_list.append({
+                "start": start,
+                "summary": summary,
+                "id": event_id
+            })
 
-# Test function
+        return event_list
+    except Exception as e:
+        print(f"Error listing events: {e}")
+        return []
+
+
+def parse_user_instruction(instruction: str):
+    """
+    Parse a natural language user instruction into event details.
+    Example: 'Book a meeting with Alex tomorrow at 12 PM for 90 minutes'
+    """
+    # 1. Extract event summary
+    summary_match = re.search(r"(meeting|call|event|appointment|session|chat) with (.+?)(?:\s+tomorrow|\s+today|\s+next|\s+at|\s+on|$)", instruction, re.IGNORECASE)
+    if summary_match:
+        summary = f"{summary_match.group(1).capitalize()} with {summary_match.group(2).strip()}"
+    else:
+        summary = "Untitled Event"
+
+    # 2. Extract duration (default = 60 minutes)
+    duration_match = re.search(r"for (\d+)\s*(minutes|min|hours|hrs|h)?", instruction, re.IGNORECASE)
+    duration = 60  # default 1 hour
+    if duration_match:
+        amount = int(duration_match.group(1))
+        unit = duration_match.group(2) or "minutes"
+        if "hour" in unit or "h" in unit:
+            duration = amount * 60
+        else:
+            duration = amount
+
+    # 3. Parse datetime
+    now = datetime.now(KARACHI_TZ)
+    dt = dateparser.parse(
+        instruction,
+        settings={
+            "TIMEZONE": "Asia/Karachi",
+            "RETURN_TIMEZONE_AS_AWARE": True,
+            "PREFER_DATES_FROM_FUTURE": True,
+            "RELATIVE_BASE": now
+        },
+    )
+    if not dt:
+        raise ValueError(f"Could not parse datetime from instructions: '{instruction}'")
+
+    start_time = dt.astimezone(KARACHI_TZ)
+    end_time = start_time + timedelta(minutes=duration)
+
+    return summary, start_time.isoformat(), end_time.isoformat()
+
+
+def create_event_from_instruction(instruction, description=""):
+    """
+    Fully autonomous event creator.
+    Takes plain user instruction and creates Google Calendar event.
+    """
+    try:
+        summary, start_time, end_time = parse_user_instruction(instruction)
+
+        result = create_event(
+            summary=summary,
+            description=description,
+            start_time=start_time,
+            end_time=end_time
+        )
+
+        return f"✅ Scheduled: {summary}\n🕒 {start_time} → {end_time}\n{result}"
+
+    except Exception as e:
+        return f"⚠️ Could not schedule event: {e}"
+
+
 def test_calendar():
+    """Test function for Google Calendar integration"""
     try:
         print("🧪 Testing Google Calendar integration...")
         
@@ -229,8 +307,6 @@ def test_calendar():
         print(f"Test failed: {e}")
         return False
 
+
 if __name__ == "__main__":
     test_calendar()
-
-
-

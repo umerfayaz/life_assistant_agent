@@ -1,7 +1,8 @@
-from calendar_integration import create_event, update_event, list_events
+from ai_sidekick.calendar_integration import create_event, update_event, list_events
 from playwright.async_api import async_playwright
 from langgraph.prebuilt import ToolNode
-from duffel_client import search_flights, book_flight
+from typing import Optional
+from .duffel_client import search_flights, book_flight
 from langchain_community.agent_toolkits import PlayWrightBrowserToolkit
 from dotenv import load_dotenv
 import os
@@ -9,7 +10,9 @@ from pydantic import BaseModel, Field
 import requests
 import smtplib
 from langchain_core.tools import StructuredTool
+from langchain_core.tools import tool
 from email.mime.text import MIMEText
+
 from email.mime.multipart import MIMEMultipart
 from langchain.agents import Tool
 from langchain_community.agent_toolkits import FileManagementToolkit
@@ -21,10 +24,10 @@ import asyncio
 
 load_dotenv(override=True)
 
-# Global variables for API credentials
-pushover_token = os.getenv("PUSHOVER_TOKEN")
-pushover_user = os.getenv("PUSHOVER_USER")
-pushover_url = "https://api.pushover.net/1/messages.json"
+# # Global variables for API credentials
+# pushover_token = os.getenv("PUSHOVER_TOKEN")
+# pushover_user = os.getenv("PUSHOVER_USER")
+# pushover_url = "https://api.pushover.net/1/messages.json"
 
 # Initialize search wrapper with error handling
 try:
@@ -104,34 +107,35 @@ def send_email(subject: str, body: str, to_email: str) -> str:
     except Exception as e:
         return f"Email sending error: {str(e)}"
 
-
-def push(text: str) -> str:
-    """
-    Send a push notification to the user via Pushover
-    """
+@tool
+def slack_notification_tool(message: str) -> str:
+    """Send a notification to Slack channel"""
     try:
-        if not pushover_token or not pushover_user:
-            return "Error: Pushover credentials not configured"
+        import os
+        import requests
         
-        response = requests.post(
-            pushover_url, 
-            data={
-                "token": pushover_token, 
-                "user": pushover_user, 
-                "message": str(text)[:1024]  # Limit message length
-            },
-            timeout=10  # Add timeout
-        )
+        # Get Slack webhook URL from environment
+        slack_webhook_url = os.getenv("SLACK_WEBHOOK_URL")
+        
+        if not slack_webhook_url:
+            return "Slack webhook URL not configured"
+        
+        # Send to Slack
+        payload = {
+            "text": message,
+            "username": "AI Assistant",
+            "icon_emoji": ":robot_face:"
+        }
+        
+        response = requests.post(slack_webhook_url, json=payload, timeout=10)
         
         if response.status_code == 200:
-            return "Push notification sent successfully"
+            return f"Slack notification sent successfully: {message[:50]}..."
         else:
-            return f"Push notification failed: {response.status_code}"
+            return f"Failed to send Slack notification: HTTP {response.status_code}"
             
-    except requests.RequestException as e:
-        return f"Push notification error: {str(e)}"
     except Exception as e:
-        return f"Unexpected push notification error: {str(e)}"
+        return f"Failed to send Slack notification: {str(e)}"
 
 
 class FlightSearchInput(BaseModel):
@@ -196,9 +200,9 @@ class GetMeetingInput(BaseModel):
     n: int = Field(default=5, description = "Number of meetings retrieve")
 
 class RescheduleMeetingInput(BaseModel):
-    event_id: str = Field(description = " Google Calendar Event ID to update")
+    event_id: Optional[str] = Field(default =None, description = " Google Calendar Event ID to update")
     summary: str = Field(default = None, description = "New Meeting Title")
-    description: str = Field(default=None, descripiton = "New Meeting description")
+    description: str = Field(default=None, description = "New Meeting description")
     start_time: str = Field(default = None, description = "New start time in ISO format")
     end_time: str = Field(default=None, description = "New end time is ISO format")
 
@@ -247,28 +251,109 @@ def get_structured_meeting(n: int = 5,) -> str:
         print(f"Exceoption {error_msg}")
         return error_msg
 
-def reschedule_meeting_structured(event_id: str, description: str = None, summary: str = None, start_time: str = None, end_time: str = None ) -> str:
+def reschedule_meeting_structured(event_id: Optional[str] = None, summary: Optional[str] = None, description: Optional[str] = None, start_time: Optional[str] = None, end_time: Optional[str] = None) -> str:
     try:
-        print(f"reschedule_meeting_structured with event_Id={event_id}")
+        print(f"[DEBUG] Reschedule called with -> event_id={event_id}, summary={summary}, start_time={start_time}, end_time={end_time}")
 
+        # If no event_id provided, try to find it
         if not event_id:
-            return "Error: Required Event ID"
+            if summary:
+                try:
+                    print(f"[DEBUG] Looking for event with summary: '{summary}'")
+                    meetings_result = list_events(20)  # Get recent meetings
+                    print(f"[DEBUG] Raw meetings result: {meetings_result[:200]}...")  # First 200 chars
+                    
+                    # Handle different response formats
+                    events_to_search = []
+                    
+                    if isinstance(meetings_result, str):
+                        try:
+                            import json
+                            meetings_data = json.loads(meetings_result)
+                            if isinstance(meetings_data, dict) and 'items' in meetings_data:
+                                events_to_search = meetings_data['items']
+                            elif isinstance(meetings_data, list):
+                                events_to_search = meetings_data
+                        except json.JSONDecodeError:
+                            # Maybe it's a formatted string, try to parse it differently
+                            print(f"[DEBUG] Could not parse as JSON, treating as string")
+                            # You might need to implement string parsing here based on your list_events format
+                            return f"Error: Could not parse calendar events. Raw response: {meetings_result[:100]}..."
+                    elif isinstance(meetings_result, dict):
+                        if 'items' in meetings_result:
+                            events_to_search = meetings_result['items']
+                        else:
+                            events_to_search = [meetings_result]
+                    elif isinstance(meetings_result, list):
+                        events_to_search = meetings_result
+                    
+                    print(f"[DEBUG] Found {len(events_to_search)} events to search")
+                    
+                    # Look for matching event by summary (case-insensitive)
+                    found_event_id = None
+                    for event in events_to_search:
+                        if isinstance(event, dict):
+                            event_summary = event.get('summary', '') or event.get('title', '')
+                            event_id_candidate = event.get('id', '') or event.get('event_id', '')
+                            
+                            print(f"[DEBUG] Checking event: '{event_summary}' (ID: {event_id_candidate})")
+                            
+                            # Try exact match first
+                            if event_summary.lower().strip() == summary.lower().strip():
+                                found_event_id = event_id_candidate
+                                print(f"[DEBUG] Exact match found! Event ID: {found_event_id}")
+                                break
+                            
+                            # Try partial match
+                            elif summary.lower().strip() in event_summary.lower() or event_summary.lower() in summary.lower().strip():
+                                found_event_id = event_id_candidate
+                                print(f"[DEBUG] Partial match found! Event ID: {found_event_id}")
+                                # Don't break here, continue looking for exact match
+                    
+                    if found_event_id:
+                        event_id = found_event_id
+                        print(f"[DEBUG] Using event ID: {event_id}")
+                    else:
+                        # List all available events for debugging
+                        available_events = []
+                        for event in events_to_search:
+                            event_summary = event.get('summary', '')
+                            if event_summary:
+                                available_events.append(event_summary)
+                        
+                        return f"Error: Could not find a meeting with title '{summary}'. Available meetings: {', '.join(available_events[:5])}{'...' if len(available_events) > 5 else ''}"
+                        
+                except Exception as lookup_error:
+                    print(f"[DEBUG] Error during event lookup: {lookup_error}")
+                    import traceback
+                    print(f"[DEBUG] Traceback: {traceback.format_exc()}")
+                    return f"Error: Could not search for existing meetings: {str(lookup_error)}"
+            else:
+                return "Error: Either event_id or meeting summary is required for rescheduling."
 
+        # Validate that we have something to update
+        if not any([summary, description, start_time, end_time]):
+            return "Error: At least one field (summary, description, start_time, or end_time) must be provided for rescheduling."
+
+        print(f"[DEBUG] Calling update_event with event_id={event_id}")
         result = update_event(
             event_id=event_id,
-            description=description,
             summary=summary,
+            description=description,
             start_time=start_time,
             end_time=end_time
         )
 
-        print(f"event updated in reschedule_meeting: {result}")
+        print(f"[DEBUG] Update result: {result}")
         return result
 
     except Exception as e:
-        error_msg = (f"reschedule meeting is not updated{str(e)} ")
-        print(f"Exceiption: {error_msg}")
+        error_msg = f"Reschedule meeting failed: {str(e)}"
+        print(f"[DEBUG] Exception in reschedule: {error_msg}")
+        import traceback
+        print(f"[DEBUG] Full traceback: {traceback.format_exc()}")
         return error_msg
+
 
  
 
@@ -376,7 +461,7 @@ async def other_tools():
     # Email tool
     try:
         email_tool = StructuredTool.from_function(
-            name="send_email",
+            name="reply_email",
             func=send_email,
             args_schema=EmailInput,
             description=(
@@ -401,21 +486,7 @@ async def other_tools():
         print("✓ Flight booking tool added")
     except Exception as e:
         print(f"⚠ Flight booking tool error: {e}")
-
-    # Push notification tool
-    try:
-        if pushover_token and pushover_user:
-            push_tool = Tool(
-                name="send_push_notification", 
-                func=push, 
-                description="Send a push notification to the user. Use this when you need to notify the user about something important."
-            )
-            tools_list.append(push_tool)
-            print("✓ Push notification tool added")
-        else:
-            print("⚠ Push notification tool skipped - credentials missing")
-    except Exception as e:
-        print(f"⚠ Push notification tool error: {e}")
+   
 
     # File management tools
     try:

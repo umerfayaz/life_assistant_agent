@@ -1,5 +1,6 @@
+from ast import keyword
 from re import escape
-from agent_config import AGENT_NAME, USER_NAME, USER_PASSWORD, personal_commands, agent_knowledge
+from .agent_config import AGENT_NAME, USER_NAME, USER_PASSWORD, personal_commands, agent_knowledge
 from typing import Annotated, List, Any, Optional, Dict
 from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, START, END
@@ -10,11 +11,13 @@ from langchain_groq import ChatGroq
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
-from sidekick_tools import playwright_tools, other_tools
+from ai_sidekick.sidekick_tools import playwright_tools, other_tools
+from ai_sidekick.sidekick_tools import slack_notification_tool
 import uuid
 import os
 import asyncio
 from datetime import datetime
+import json
 
 load_dotenv(override=True)
 
@@ -50,6 +53,7 @@ class Sidekick:
         try:
             self.tools, self.browser, self.playwright = await playwright_tools()
             additional_tools = await other_tools()
+            additional_tools.append(slack_notification_tool)
             self.tools += additional_tools
             print(f"✓ Loaded {len(self.tools)} tools successfully")
         except Exception as e:
@@ -58,11 +62,11 @@ class Sidekick:
 
         try:
             worker_llm = ChatGroq(
-                model="deepseek-r1-distill-llama-70b",
+                model="openai/gpt-oss-120b",
                 api_key=os.getenv("GROQ_API_KEY"),
                 temperature=0.7,
                 max_tokens=4096,
-                stop_sequences=["<function=", "</function>", "function="]
+                # stop_sequences=["<function=", "</function>", "function="]
             )
 
             if self.tools:
@@ -71,7 +75,7 @@ class Sidekick:
                 self.worker_llm_with_tools = worker_llm
 
             evaluator_llm = ChatGroq(
-                model="deepseek-r1-distill-llama-70b",
+                model="openai/gpt-oss-120b",
                 api_key=os.getenv("GROQ_API_KEY"),
                 temperature=0.7,
             )
@@ -84,6 +88,83 @@ class Sidekick:
         except Exception as e:
             print(f"✗ Error in setup: {e}")
             raise
+
+    PLANNER_SYSTEM_PROMPT = """
+You are the Planner agent in a LangGraph workflow. 
+Your job is to decide the next step based on the user’s request or the latest task result.
+
+Available next steps (nodes, not tools!):
+- worker → reasoning / execution
+- tools → when you need an actual tool (search, email, flight booking, Slack notification, etc.)
+- evaluator → review output and decide next actions
+- slack → send a user-facing Slack notification
+- END → finish workflow
+
+
+Special Slack instructions:
+- If the output is news summaries, alerts, confirmations, or user-facing updates, 
+  set "next": "slack".
+- Always keep Slack messages short (under 200 characters) and engaging. Use emojis where relevant.
+- For backend logic or intermediate steps, route to worker or evaluator instead.
+
+Your response must be a JSON object with this format:
+{
+  "next": "worker" | "tools" | "evaluator" | "slack" | "END",
+  "content": "...summary or message for the next node..."
+}
+"""
+
+    async def planner(self, state: State) -> Dict[str, Any]:
+        """Planner that decides what the agent should do next"""
+        last_message = state["messages"][-1].content if state["messages"] else ""
+    
+        # Create a more specific prompt for the planner
+        planner_prompt = f"""
+        You are a Planner agent. Analyze the current state and decide the next action.
+        
+        Current state: {state}
+        Last message: {last_message}
+    
+    Available actions:
+    - worker: For reasoning, processing, or general responses
+    - tools: When specific tools need to be called (search, email, calendar, etc.)
+    - evaluator: To review and evaluate responses
+    - slack: For sending user-facing notifications, news digests, alerts, or confirmations
+    - END: To finish the workflow
+    
+    Respond with ONLY a JSON object in this exact format:
+    {{"next": "worker|tools|evaluator|slack|END", "content": "brief explanation"}}
+        """
+        
+        decision = await self.worker_llm_with_tools.ainvoke([
+            SystemMessage(content=planner_prompt),
+            HumanMessage(content=f"Decide next action based on: {last_message}")
+        ])
+        
+        try:
+            # Try to parse JSON from the response
+            import json
+            response_content = decision.content.strip()
+            
+            # Clean up the response if it has extra text
+            if '{' in response_content and '}' in response_content:
+                start = response_content.find('{')
+                end = response_content.rfind('}') + 1
+                json_str = response_content[start:end]
+                parsed = json.loads(json_str)
+                
+                next_step = parsed.get("next", "worker").lower()
+                if next_step not in ["worker", "tools", "evaluator", "slack", "end"]:
+                    next_step = "worker"
+                    
+                return {"next": next_step, "content": parsed.get("content", "")}
+            else:
+                # Fallback if JSON parsing fails
+                return {"next": "worker", "content": "Routing to worker"}
+                
+        except Exception as e:
+            print(f"Planner parsing error: {e}")
+            return {"next": "worker", "content": "Fallback to worker"}
 
     def worker(self, state: State) -> Dict[str, Any]:
         """
@@ -242,70 +323,32 @@ class Sidekick:
                 return {"messages": [AIMessage(content=f"❌ Failed to generate email: {str(e)}")]}
 
         try:
-            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            success_criteria = state.get("success_criteria", "Provide helpful response")
             tool_names = ", ".join([tool.name for tool in self.tools]) if self.tools else "None"
+            
+            system_message = f"""
+You are {AGENT_NAME}, a personal AI assistant for {USER_NAME}.
+You respond naturally and conversationally like a human.
 
-            system_message = (
-              f"""You are {AGENT_NAME}, a personal AI assistant.
-You assist {USER_NAME} with daily tasks, reminders, and knowledge.
-Here is your background knowledge: {agent_knowledge}
-Always respond in a friendly and helpful way.
+CORE BEHAVIOR:
+- If a user asks for something that requires a tool ({tool_names}), you MUST:
+  1. Produce a natural, conversational reply for the user (e.g., "Okay, I'll schedule that for you").
+  2. ALSO produce an invisible structured tool call in the background.
 
-CRITICAL INSTRUCTIONS:
-- You have access to these tools: """
-                + tool_names
-                + """
-- When you need to use a tool, the system will handle the tool calls automatically
-- DO NOT write function calls in your response text like <function=...> or function=...
-- DO NOT include any XML-like syntax or manual function calling in your responses
-- Simply describe what you want to do in natural language, and if tools are needed, they will be called automatically
-- Always respond in natural, conversational language
+RULES FOR CALENDAR:
+- If the user asks to book, schedule, create, or manage an event/meeting, you MUST use the calendar tool (`calendar_booking`) instead of just replying in text.
+- Always confirm missing details (title, date, time, duration, time zone, participants) before booking.
+- Once details are clear, ALWAYS trigger the `calendar_booking` tool.
+- Do NOT simulate a booking in text only. If booking is possible, call the tool.
+- Never show raw JSON, tool names, or system calls to the user.
 
-Available tools: """
-                + tool_names
-                + """
-
-EXAMPLES of what NOT to do:
-❌ WRONG: <function=search{"query":"weather"}></function>
-❌ WRONG: function=search{"query":"weather"}
-❌ WRONG: Let me search for that <function call syntax>
-
-EXAMPLES of what TO do:
-✅ CORRECT: I'll search for the weather information for you.
-✅ CORRECT: Let me look that up for you.
-✅ CORRECT: I'll help you find that information.
-
-Current date and time: """
-                + current_time
-                + """
-
-Success criteria: """
-                + success_criteria
-                + """
-
-Respond naturally and conversationally. The system will automatically handle any tool usage needed.
-
-
-🚨 CRITICAL INSTRUCTIONS FOR CALENDAR OPERATIONS:
-- When users ask to book/schedule/create meetings or events, you MUST use the "booking_meeting" tool
-- When users ask to see meetings/appointments, you MUST use the "get_meetings" tool
-- When users ask to reschedule meetings, you MUST use the "reschedule_meeting" tool
-- NEVER say you've booked a meeting unless you actually called the booking_meeting tool
-- NEVER provide fake meeting IDs or pretend to have done something
-
-📅 EXAMPLES OF WHAT YOU MUST DO:
-- User: "Book a meeting with Alex tomorrow at 2pm"
-  YOU MUST: Call booking_meeting tool with proper parameters
-- User: "Show me my meetings"  
-  YOU MUST: Call get_meetings tool
-
-Available tools: {tool_names}
-
-Current date and time: {current_time}
-Success criteria: {success_criteria}
+GENERAL:
+- Always provide BOTH:
+  1. A friendly, natural response for the user.
+  2. An invisible, structured tool call for the system.
 """
-            )
+
+
+
 
             if state.get("feedback_on_work"):
                 system_message += f"""
@@ -458,6 +501,7 @@ Please address this feedback in your response.
 
         return result
 
+
     def evaluator(self, state: State) -> Dict[str, Any]:
         try:
             last_message = state["messages"][-1]
@@ -507,14 +551,36 @@ Please evaluate if the success criteria is met and provide feedback.
                 "user_input_needed": True,
             }
 
-    def route_based_on_evaluation(self, state: State) -> str:
+    def route_based_on_evaluation(self, State: State) ->str:
+
         try:
-            if state.get("success_criteria_met") or state.get("user_input_needed"):
+            if State.get("success_criteria_met"):
+
+                assistant_content = None
+                for msg in reversed(State.get("messages", [])):
+                    if hasattr(msg, 'content') and msg.content:
+                        content = msg.content
+
+                        if not content.startswith("Evaluator Feedback"):
+                            assistant_content = content
+                            break
+
+
+                        if assistant_content:
+                            content_lower = assistant_content.lower()
+                            if any(keyword in content_lower for keyword in [
+                                "news", "completed", "alert", "scheduled",
+                                "meeting", "digesr", "booked", "confirmed",                
+                            ]):
+
+                             State["slack_content"] = assistant_content
+
+            if State.get["success_criteria_met"] and State.get["user_input_needed"]:
                 return "END"
             return "worker"
         except Exception as e:
-            print(f"Evaluation routing error: {e}")
-            return "END"
+            print(f"Evaluator routing error: {e}")
+            return "END"   
 
     def format_conversation(self, messages: List[Any]) -> str:
         conversation = ""
@@ -530,6 +596,66 @@ Please evaluate if the success criteria is met and provide feedback.
                 conversation += "Assistant: [Error formatting message]\n"
         return conversation
 
+
+    async def slack_node(self, State: State) -> Dict[str, Any]:
+     """Handle Sending Slack Notifications"""
+
+     try:
+        message_to_send = None
+
+        if "slack_content" in State:
+            message_to_send = ["slack_content"]
+
+
+        elif State.get("messsages"):
+            for msg in reversed(State["messages"]):
+                if hasattr(msg, 'content') and msg.content:
+                    content = msg.content
+
+                    if (not content.startswith("Evaluator Feedback:")and 
+                    not content.startswith("slack notification sent:")and 
+                    not content.startswith("System:")and
+                    " Ai digest:" in content or
+                    "digest" in content.lower()or
+                    "news" in content.lower()):
+
+                     message_to_send = content
+                     break
+
+        if not message_to_send and State.get("messages"):
+            for msg in reversed(State["messages"]):
+                if hasattr(msg, 'content') and msg.content:
+                    content = msg.content
+                    if (not content.startswith("Evaluator Feedback")and
+                    not content.startswith("slack notification sent")and
+                    len(content.stripe())> 0):
+                     message_to_send = content
+                    break
+        
+        if not message_to_send and content in State:
+            message_to_send = State["content"]
+
+        if not message_to_send:
+            message_to_send = "No Messsage Content found"
+
+        print(f"[Debug] Slack Node is sending {message_to_send[:100]}...")
+
+        result = slack_notification_tool(message_to_send)
+
+        return {
+            "messages": [AIMessage(content = f"Slack notification sent Successfully{result}")],
+            "last_output": result
+        }
+
+     except Exception as e:
+        print(f"Failed to send slack notification{e}")
+        
+        return {
+            "messages": [AIMessage(content = f" Failed to send slack notifications{str(e)}")],
+            "last_message": f"Error{str(e)}"
+        }
+
+
     async def build_graph(self):
         """
         Build the LangGraph workflow graph
@@ -538,8 +664,10 @@ Please evaluate if the success criteria is met and provide feedback.
             graph_builder = StateGraph(State)
 
             # Add nodes
+            graph_builder.add_node("planner", self.planner)
             graph_builder.add_node("worker", self.worker)
             graph_builder.add_node("evaluator", self.evaluator)
+            graph_builder.add_node("slack", self.slack_node)
 
             # Add tools node if tools are available
             if self.tools:
@@ -553,20 +681,29 @@ Please evaluate if the success criteria is met and provide feedback.
                 )
                 
                 # Add edge from tools back to worker
-                graph_builder.add_edge("tools", "worker")
+                graph_builder.add_edge("tools", "planner")
             else:
                 # If no tools, go directly to evaluator
                 graph_builder.add_edge("worker", "evaluator")
+
+            # planner routes to next node
+            graph_builder.add_conditional_edges(
+                "planner",
+                lambda State: State.get("next", "worker"),
+                {"worker": "worker", "tools": "tools", "evaluator": "evaluator", "slack": "slack", "end": END}
+            )
 
             # Add conditional edges from evaluator
             graph_builder.add_conditional_edges(
                 "evaluator", 
                 self.route_based_on_evaluation, 
-                {"worker": "worker", "END": END}
+                {"worker": "worker","slack": "slack", "END": END}
             )
+
+            graph_builder.add_edge("slack", END)
             
             # Set start edge
-            graph_builder.add_edge(START, "worker")
+            graph_builder.add_edge(START, "planner")
 
             # Compile the graph with memory
             self.graph = graph_builder.compile(checkpointer=self.memory)
@@ -575,9 +712,14 @@ Please evaluate if the success criteria is met and provide feedback.
             print(f"✗ Graph building error: {e}")
             raise
 
+
     async def run_superstep(
-            self, message: str, success_criteria: str, history: List[Dict], _allowed_tools: Optional[List[str]] = None
-        ):
+        self, 
+        message: str, 
+        success_criteria: str, 
+        history: List[Dict], 
+        _allowed_tools: Optional[List[str]] = None
+    ):
         try:
             state = {
                 "messages": [HumanMessage(content=message)],
@@ -594,20 +736,70 @@ Please evaluate if the success criteria is met and provide feedback.
             messages = result.get("messages", [])
             user_msg = {"role": "user", "content": message}
 
+            print(f"[Debug] Messages length: {len(messages)}")
+            print(f"[Debug] Messages types: {[type(msg) for msg in messages]}")
+            
             if len(messages) >= 2:
-                assistant_content = getattr(messages[-2], "content", "No response")
-                feedback_content = getattr(messages[-1], "content", "No feedback")
+                # Safely extract content from message objects
+                assistant_msg_obj = messages[-2]
+                feedback_msg_obj = messages[-1]
+                
+                print(f"[Debug] Assistant message type: {type(assistant_msg_obj)}")
+                print(f"[Debug] Feedback message type: {type(feedback_msg_obj)}")
+                
+                # Safe content extraction
+                if hasattr(assistant_msg_obj, 'content'):
+                    assistant_content = assistant_msg_obj.content
+                elif isinstance(assistant_msg_obj, dict):
+                    assistant_content = assistant_msg_obj.get('content', 'No response')
+                elif isinstance(assistant_msg_obj, str):
+                    assistant_content = assistant_msg_obj
+                else:
+                    assistant_content = str(assistant_msg_obj)
+                
+                if hasattr(feedback_msg_obj, 'content'):
+                    feedback_content = feedback_msg_obj.content
+                elif isinstance(feedback_msg_obj, dict):
+                    feedback_content = feedback_msg_obj.get('content', 'No feedback')
+                elif isinstance(feedback_msg_obj, str):
+                    feedback_content = feedback_msg_obj
+                else:
+                    feedback_content = str(feedback_msg_obj)
 
                 assistant_msg = {"role": "assistant", "content": assistant_content}
                 feedback_msg = {"role": "system", "content": feedback_content}
 
+                print(f"[Debug] Extracted assistant content: {assistant_content[:100]}...")
+                print(f"[Debug] Extracted feedback content: {feedback_content[:100]}...")
+
                 return history + [user_msg, assistant_msg, feedback_msg]
+                
+            elif len(messages) == 1:
+                # Handle single message case
+                single_msg_obj = messages[0]
+                
+                if hasattr(single_msg_obj, 'content'):
+                    content = single_msg_obj.content
+                elif isinstance(single_msg_obj, dict):
+                    content = single_msg_obj.get('content', 'No response')
+                elif isinstance(single_msg_obj, str):
+                    content = single_msg_obj
+                else:
+                    content = str(single_msg_obj)
+                    
+                assistant_msg = {"role": "assistant", "content": content}
+                return history + [user_msg, assistant_msg]
+                
             else:
+                print("[Debug] No messages in result, using fallback")
                 error_msg = {"role": "assistant", "content": "I encountered an issue processing your request."}
                 return history + [user_msg, error_msg]
 
         except Exception as e:
             print(f"Run superstep error: {e}")
+            import traceback
+            print(f"Traceback: {traceback.format_exc()}")
+            
             user_msg = {"role": "user", "content": message}
             error_msg = {"role": "assistant", "content": f"Error: {str(e)}"}
             return history + [user_msg, error_msg]
@@ -631,13 +823,6 @@ Please evaluate if the success criteria is met and provide feedback.
                 print(f"Cleanup error: {e}")
 
 
-    def test_tools(self):
-        """Test if tools are working"""
-        response = self.worker_llm_with_tools.invoke([
-        HumanMessage(content="Search for weather in Karachi")
-       ])
-        print(f"Test response: {response}")
-        print(f"Test tool calls: {getattr(response, 'tool_calls', [])}")
 
 
               

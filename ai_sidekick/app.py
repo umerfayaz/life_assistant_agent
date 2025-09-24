@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import asyncio
-from sidekick import Sidekick
+from ai_sidekick.sidekick import Sidekick
 
 app = Flask(__name__)
 CORS(app)
